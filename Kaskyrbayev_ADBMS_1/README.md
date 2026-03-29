@@ -31,14 +31,10 @@
 
 ## Explain Output — Task #8
 
-Query: `db.products.find({ category:"Cameras", brand:"Contoso" }).sort({ price:1 })`
-
-| Scenario | Stage | nReturned | keysExamined | docsExamined |
-|---|---|---|---|---|
-| **With** compound index | IXSCAN | 2 | 2 | 2 |
-| **Without** index (dropped) | COLLSCAN | 2 | 0 | 40 |
-
-With the index, key:doc ratio is 1:1. Without it, all 40 documents are scanned to find 2 — a 20× increase in `docsExamined`.
+Query: db.products.find({ category:"Cameras", brand:"Contoso" }).sort({ price:1 })
+ScenarioStagenReturnedkeysExamineddocsExaminedWith compound indexSORT2040Without index (dropped)SORT2040
+Observation: Both plans show docsExamined: 40 and a SORT stage. This indicates the planner chose a COLLSCAN + in-memory sort in both cases, likely because the collection is small (40 docs) and MongoDB's cost model favours a full scan over index lookup when the collection fits easily in memory.
+What this means: The compound index { tenantId:1, category:1, brand:1, price:1 } exists but the query does not include tenantId in the filter — the leading key is skipped, so the index cannot be used for a prefix scan. To force index use, either add tenantId to the filter or create a narrower index { category:1, brand:1, price:1 } that matches the actual query shape.
 
 ![alt text](image.jpg)
 ![alt text](image-1.jpg)
