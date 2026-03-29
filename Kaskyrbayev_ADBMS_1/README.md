@@ -42,8 +42,8 @@ Query: `db.products.find({ category:"Cameras", brand:"Contoso" }).sort({ price:1
 
 **What this means:** The compound index `{ tenantId:1, category:1, brand:1, price:1 }` exists but the query does not include `tenantId` in the filter — the leading key is skipped, so the index cannot be used for a prefix scan. To force index use, either add `tenantId` to the filter or create a narrower index `{ category:1, brand:1, price:1 }` that matches the actual query shape.
 
-![alt text](image.jpg)
-![alt text](image-1.jpg)
+![alt text](image.png)
+![alt text](image-1.png)
 
 ---
 
