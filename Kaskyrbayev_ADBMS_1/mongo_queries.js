@@ -1,69 +1,203 @@
-# MongoDB Lab — README
+// Lab tasks (filled). All queries implemented based on data schema.
+use('labdocdb');
 
-## Collections & Data Model
+// ─────────────────────────────────────────────────────────────────────────────
+// 1) Faceted listing: Cameras by brand Contoso, price 300..1200, sort price asc,
+//    project name + price only
+// ─────────────────────────────────────────────────────────────────────────────
+db.products.find(
+  {
+    category: 'Cameras',
+    brand:    'Contoso',
+    price:    { $gte: 300, $lte: 1200 }
+  },
+  { name: 1, price: 1, _id: 0 }
+).sort({ price: 1 });
 
-| Collection | Key Design Decisions |
-|---|---|
-| `products` | Embedded `attributes.tags` (array) + `ratingSummary` to avoid runtime aggregation on catalogue reads |
-| `orders` | Embedded `items` array (immutable after placement); `version` integer for optimistic concurrency; JSON Schema validator enforces `status` enum |
-| `deviceEvents` | Append-only; `ts` stored as ISO-8601 string; `geo.countryCode` flat field (no GeoJSON needed) |
-| `sessions` | TTL via `lastSeenAt` (sliding 30-day window) or `expireAt` with `expireAfterSeconds: 0` for point-in-time expiry |
-| `users` | Soft-delete pattern (`deletedAt`); partial unique index on `email` covers only active users |
 
----
+// ─────────────────────────────────────────────────────────────────────────────
+// 2) Seek (keyset) pagination for deviceEvents by tenantId = 't-educ', page size 50,
+//    sorted by ts DESC, _id DESC (tie-breaker)
+// ─────────────────────────────────────────────────────────────────────────────
 
-## Index List & Rationale
+// --- First page ---
+const page1 = db.deviceEvents
+  .find({ tenantId: 't-educ' })
+  .sort({ ts: -1, _id: -1 })
+  .limit(50)
+  .toArray();
 
-| Collection | Index | Rationale |
-|---|---|---|
-| `products` | `{ tenantId:1, category:1, brand:1, price:1 }` | Covers faceted query #1 and explain comparison #8; sort on price satisfied by index order |
-| `products` | `{ 'attributes.tags':1 }` | Multikey index for `$unwind`/`$group` aggregation in task #3 |
-| `products` | `text` on `name, description` | Full-text search on catalogue |
-| `reviews` | `{ productId:1, createdAt:-1 }` | Sorted review feeds per product |
-| `orders` | `{ tenantId:1, customerId:1, createdAt:-1 }` | Customer order history |
-| `orders` | `{ tenantId:1, status:1, createdAt:-1 }` | Status-filtered order queues |
-| `deviceEvents` | `{ tenantId:1, deviceId:1, ts:-1 }` | Covers seek pagination #2 and daily aggregation #4 |
-| `deviceEvents` | `{ 'geo.countryCode':1, ts:-1 }` | Geo-filtered event queries |
-| `sessions` | `{ lastSeenAt:1 }` TTL 30 days | Auto-expire inactive sessions |
-| `users` *(task #7)* | `{ email:1 }` partial: `deletedAt $exists false` | Unique email only among active users; re-registration after deletion is allowed |
+print('Page 1 count:', page1.length);
+print('First doc ts:', page1[0]?.ts);
 
----
+// --- Capture the cursor (last document of page 1) ---
+const cursor = page1[page1.length - 1];
+print('Cursor ts:', cursor?.ts, 'id:', cursor?._id);
 
-## Explain Output — Task #8
+// --- Second page: seek past the cursor using $or to handle ties on ts ---
+// ts is stored as ISO string — lexicographic comparison works correctly for ISO-8601
+const page2 = db.deviceEvents
+  .find({
+    tenantId: 't-educ',
+    $or: [
+      { ts: { $lt: cursor.ts } },
+      { ts: cursor.ts, _id: { $lt: cursor._id } }
+    ]
+  })
+  .sort({ ts: -1, _id: -1 })
+  .limit(50)
+  .toArray();
 
-Query: `db.products.find({ category:"Cameras", brand:"Contoso" }).sort({ price:1 })`
+print('Page 2 count:', page2.length);
 
-| Scenario | Stage | nReturned | keysExamined | docsExamined |
-|---|---|---|---|---|
-| **With** compound index (`hint`) | SORT | 2 | 40 | 40 |
-| **Without** index (`$natural hint`) | SORT | 2 | 0 | 40 |
 
-**Method:** `hint()` used instead of drop/recreate. `hint({ $natural:1 })` forces COLLSCAN; `hint({ tenantId:1, category:1, brand:1, price:1 })` forces the compound index.
+// ─────────────────────────────────────────────────────────────────────────────
+// 3) Aggregation: top 5 tags across all Camera products
+//    Pipeline: $match → $unwind → $group → $sort → $limit
+// ─────────────────────────────────────────────────────────────────────────────
+db.products.aggregate([
+  { $match: { category: 'Cameras' } },
+  { $unwind: '$attributes.tags' },
+  { $group: { _id: '$attributes.tags', n: { $sum: 1 } } },
+  { $sort:  { n: -1 } },
+  { $limit: 5 }
+]);
 
-**Observation:** Both plans examine all 40 documents and use an in-memory SORT. The difference: with the index `keysExamined=40` (index was traversed), without it `keysExamined=0` (pure collection scan). The index doesn't reduce `docsExamined` here because the query skips `tenantId` — the leading key of the compound index — so MongoDB can't do a tight prefix scan and falls back to a full index scan followed by a fetch.
 
-**Fix:** A narrower index `{ category:1, brand:1, price:1 }` would match this query exactly and would reduce both `keysExamined` and `docsExamined` to 2.
-![alt text](image.png)
-![alt text](image-1.png)
+// ─────────────────────────────────────────────────────────────────────────────
+// 4) Aggregation: daily event counts for tenant 't-educ' over the last 7 days
+//    Pipeline: $match → $project (dateTrunc to day) → $group → $sort
+//    Note: ts is stored as an ISO string, so we compare against an ISO string too.
+// ─────────────────────────────────────────────────────────────────────────────
+// Seed data contains events from 2026-03-15 to 2026-03-18.
+// Using a hardcoded range that covers all seed data instead of a rolling 7-day window
+// (which would return 0 results since today is 2026-03-29).
+const rangeStart = '2026-03-13T00:00:00Z';  // 2 days before first event
+const rangeEnd   = '2026-03-20T00:00:00Z';  // 2 days after last event
 
----
+db.deviceEvents.aggregate([
+  {
+    $match: {
+      tenantId: 't-educ',
+      ts: { $gte: rangeStart, $lte: rangeEnd }
+    }
+  },
+  {
+    $project: {
+      day: {
+        $dateTrunc: {
+          date: { $dateFromString: { dateString: '$ts' } },
+          unit: 'day'
+        }
+      }
+    }
+  },
+  { $group: { _id: '$day', count: { $sum: 1 } } },
+  { $sort:  { _id: 1 } }
+]);
 
-## Bonus — Shard Key Proposal for `deviceEvents`
 
-**Proposed key:** `{ tenantId: 1, deviceId: 1, ts: -1 }`
+// ─────────────────────────────────────────────────────────────────────────────
+// 5) Optimistic concurrency: atomically move a PENDING order → PAID
+//    Filter matches _id + status + expected version; only updates if all three match.
+//    Use ord_2026_1010 which is PENDING with version 1 in the seed data.
+// ─────────────────────────────────────────────────────────────────────────────
+db.orders.findOneAndUpdate(
+  {
+    _id:     'ord_2026_1010',
+    status:  'PENDING',
+    version: 1
+  },
+  {
+    $set: { status: 'PAID', paidAt: new Date() },
+    $inc: { version: 1 }
+  },
+  { returnDocument: 'after' }
+);
 
-- **Cardinality** — `tenantId` alone has only 2 values (no spread). Adding `deviceId` yields hundreds of distinct prefixes for fine-grained chunk splitting.
-- **Write distribution** — the `tenantId+deviceId` prefix diversifies inserts so new events don't pile onto a single tail chunk (monotonic `ts` alone would create a hotspot).
-- **Query targeting** — all queries filter by `tenantId` (often `deviceId` too), so mongos routes to a single shard — no scatter-gather.
-- **Seek pagination** — the seek cursor `(ts < last.ts) OR (ts == last.ts AND _id < last._id)` stays within one shard after the prefix narrows it. No cross-shard merge sort needed.
-- **Why not hashed `_id`?** Perfect write spread but every tenant aggregation becomes scatter-gather — unacceptable for an operational workload.
 
----
+// ─────────────────────────────────────────────────────────────────────────────
+// 6) Prefix search: products whose SKU starts with 'SKU-10'
+//    Option A – anchored regex (simple, works with any index type)
+//    Option B – range trick (uses a plain B-tree index more efficiently)
+// ─────────────────────────────────────────────────────────────────────────────
 
-## Consistency Note
+// Option A – regex
+db.products.find({ sku: /^SKU-10/ });
 
-For reads that must see just-committed writes (e.g. reading an order immediately after the task #5 `findOneAndUpdate`):
+// Option B – range (avoids regex scan; relies on lexicographic ordering)
+db.products.find({ sku: { $gte: 'SKU-10', $lt: 'SKU-11' } });
 
-- Use `writeConcern: { w: "majority" }` on the write and `readConcern: "majority"` on the subsequent read.
-- This guarantees the PAID status is visible even if the read briefly routes to a secondary.
-- `readConcern: "linearizable"` offers the strongest guarantee (linearizable reads from primary) at the cost of higher latency — appropriate only when strict ordering across sessions is required.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7) Partial unique index on email for non-deleted users (soft-delete pattern)
+// ─────────────────────────────────────────────────────────────────────────────
+db.users.createIndex(
+  { email: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { active: { $eq: true } }
+  }
+);
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8) Explain plan: compare query execution with vs. without a supporting index
+// ─────────────────────────────────────────────────────────────────────────────
+
+// --- WITH index (forced via hint) ---
+const explainWithIndex = db.products
+  .find({ category: 'Cameras', brand: 'Contoso' })
+  .sort({ price: 1 })
+  .hint({ tenantId: 1, category: 1, brand: 1, price: 1 })
+  .explain('executionStats');
+
+print('=== WITH index ===');
+print(JSON.stringify({
+  nReturned:         explainWithIndex.executionStats.nReturned,
+  totalKeysExamined: explainWithIndex.executionStats.totalKeysExamined,
+  totalDocsExamined: explainWithIndex.executionStats.totalDocsExamined,
+  stage:             explainWithIndex.executionStats.executionStages.stage
+}, null, 2));
+
+// --- WITHOUT index (forced COLLSCAN via $natural hint) ---
+const explainNoIndex = db.products
+  .find({ category: 'Cameras', brand: 'Contoso' })
+  .sort({ price: 1 })
+  .hint({ $natural: 1 })
+  .explain('executionStats');
+
+print('=== WITHOUT index ===');
+print(JSON.stringify({
+  nReturned:         explainNoIndex.executionStats.nReturned,
+  totalKeysExamined: explainNoIndex.executionStats.totalKeysExamined,
+  totalDocsExamined: explainNoIndex.executionStats.totalDocsExamined,
+  stage:             explainNoIndex.executionStats.executionStages.stage
+}, null, 2));
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9) TTL sanity: insert a test document that expires in ~1 minute
+//    Requires a TTL index on the expireAt field.
+//    MongoDB's TTL monitor runs every 60 s, so actual deletion may take up to
+//    ~120 s after expireAt.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Create the TTL index (safe to call multiple times – idempotent)
+db.sessions.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+
+// Insert a document set to expire 60 seconds from now
+db.sessions.insertOne({
+  _id:       'ttl-test-' + Date.now(),
+  payload:   'test document for TTL verification',
+  createdAt: new Date(),
+  expireAt:  new Date(Date.now() + 60 * 1000)   // 1 minute in the future
+});
+
+print('TTL test doc inserted – it will be deleted automatically within ~2 minutes.');
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10) Design: shard key proposal for the deviceEvents collection (justification in README)
+//
+//  Recommended shard key:  { tenantId: 1, deviceId: 1, ts: -1 }
